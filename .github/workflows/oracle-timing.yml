@@ -1,0 +1,136 @@
+name: Oracle timing
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: oracle-timing
+  cancel-in-progress: false
+jobs:
+  timing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: astral-sh/setup-uv@v4
+      - name: Install Harbor
+        run: uv tool install harbor
+      - name: Open encrypted task inputs
+        env:
+          ORACLE_PAYLOAD_KEY: ${{ secrets.ORACLE_PAYLOAD_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/oracle-private"
+          if ! uv run --with cryptography==46.0.5 python - <<'PY' >"$RUNNER_TEMP/oracle-private/unpack.log" 2>&1
+          import io
+          import os
+          import tarfile
+          from pathlib import Path
+          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+          key = bytes.fromhex(os.environ['ORACLE_PAYLOAD_KEY'])
+          sealed = Path('payload.bin').read_bytes()
+          data = AESGCM(key).decrypt(sealed[:12], sealed[12:], b'oracle-timing-task-v1')
+          dest = Path(os.environ['RUNNER_TEMP']) / 'oracle-private/input'
+          dest.mkdir(mode=0o700)
+          with tarfile.open(fileobj=io.BytesIO(data), mode='r:gz') as bundle:
+              bundle.extractall(dest, filter='data')
+          PY
+          then
+            echo 'Encrypted task inputs could not be opened.'
+            exit 1
+          fi
+      - name: Measure end-to-end oracle
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          private="$RUNNER_TEMP/oracle-private"
+          output="$RUNNER_TEMP/timing-output"
+          mkdir -p "$output"
+          export TMPDIR="$private"
+          if ! python - "$private" "$output" <<'PY' >"$private/measurement.log" 2>&1
+          import json
+          import subprocess
+          import sys
+          import time
+          from datetime import datetime
+          from pathlib import Path
+
+          private, output = map(Path, sys.argv[1:])
+          results = private / 'result'
+          tasks = list((private / 'input').glob('*/task.toml'))
+          if len(tasks) != 1:
+              raise RuntimeError('Expected one task')
+          start = time.monotonic()
+          subprocess.run(['harbor', 'run', '-p', str(tasks[0].parent), '--agent', 'oracle', '--env', 'docker',
+                          '-o', str(results), '--job-name', 'timed-oracle', '-y'], check=True)
+          command_wall = time.monotonic() - start
+          trials = []
+          for record in results.glob('*/*/result.json'):
+              value = json.loads(record.read_text())
+              if value.get('config', {}).get('agent', {}).get('name') == 'oracle':
+                  trials.append((record, value))
+          if len(trials) != 1:
+              raise RuntimeError('Expected one oracle')
+          record, trial = trials[0]
+          grade = json.loads((record.parent / 'verifier/grade.json').read_text())
+          simulations = grade['stages']['simulation']['runs']
+          if not simulations or not grade['criteria'] or not all(row.get('ok') for row in simulations):
+              raise RuntimeError('Incomplete oracle simulations')
+          if trial.get('exception_info') or 'reward' not in trial['verifier_result']['rewards']:
+              raise RuntimeError('Incomplete oracle result')
+
+          def span(phase):
+              duration = (datetime.fromisoformat(phase['finished_at']) - datetime.fromisoformat(phase['started_at'])).total_seconds()
+              if duration < 0:
+                  raise ValueError('Invalid elapsed time')
+              return round(duration, 1)
+
+          timing = {
+              'oracle_setup_seconds': span(trial['environment_setup']),
+              'oracle_solve_seconds': span(trial['agent_execution']),
+              'oracle_verify_seconds': span(trial['verifier']),
+              'oracle_total_seconds': span(trial),
+              'command_wall_seconds': round(command_wall, 1),
+          }
+          dest = output / 'timing.json'
+          dest.write_text(json.dumps(timing, indent=2) + '\n')
+          PY
+          then
+            echo 'The end-to-end oracle timing could not be recorded.'
+            exit 1
+          fi
+          python - "$output/timing.json" >>"$GITHUB_STEP_SUMMARY" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+          data = json.loads(Path(sys.argv[1]).read_text())
+          print('| Phase | Seconds |')
+          print('| --- | ---: |')
+          for label, key in (
+              ('Environment setup', 'oracle_setup_seconds'),
+              ('Solve', 'oracle_solve_seconds'),
+              ('Verify', 'oracle_verify_seconds'),
+              ('Oracle total', 'oracle_total_seconds'),
+              ('Harbor command', 'command_wall_seconds'),
+          ):
+              print(f'| {label} | {float(data[key]):.1f} |')
+          PY
+      - name: Publish timing
+        uses: actions/upload-artifact@v4
+        with:
+          name: timing
+          path: ${{ runner.temp }}/timing-output/timing.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Remove decrypted inputs and private outputs
+        if: always()
+        shell: bash
+        run: rm -rf -- "$RUNNER_TEMP/oracle-private"
